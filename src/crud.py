@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Type, Tuple
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -17,7 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from . import models
 from . import orm_models
 from .orm_models import ( # noqa: F401
-    Anime, AnimeSource, Episode, User, Scraper, AnimeMetadata, Config, CacheData, ApiToken, TokenAccessLog, UaRule, BangumiAuth, OauthState, AnimeAlias, TmdbEpisodeMapping, ScheduledTask, TaskHistory, MetadataSource, ExternalApiLog
+    Anime, AnimeSource, Episode, User, Scraper, AnimeMetadata, Config, CacheData, ApiToken, TokenAccessLog, UaRule, BangumiAuth, OauthState, AnimeAlias, TmdbEpisodeMapping, ScheduledTask, TaskHistory, MetadataSource, ExternalApiLog, WebhookTask
 , RateLimitState)
 from .config import settings
 from .timezone import get_now
@@ -26,7 +26,7 @@ from .danmaku_parser import parse_dandan_xml_to_comments
 logger = logging.getLogger(__name__)
 
 # --- 新增：文件存储相关常量和辅助函数 ---
-DANMAKU_BASE_DIR = Path(__file__).parent.parent / "config" / "danmaku"
+DANMAKU_BASE_DIR = Path("/app/config/danmaku")
 
 def _generate_xml_from_comments(
     comments: List[Dict[str, Any]], 
@@ -167,8 +167,11 @@ async def get_episode_for_refresh(session: AsyncSession, episodeId: int) -> Opti
     return dict(row) if row else None
 
 async def get_or_create_anime(session: AsyncSession, title: str, media_type: str, season: int, image_url: Optional[str], local_image_path: Optional[str], year: Optional[int] = None) -> int:
-    """通过标题查找番剧，如果不存在则创建。如果存在但缺少海报，则更新海报。返回其ID。"""
+    """通过标题、季度和年份查找番剧，如果不存在则创建。如果存在但缺少海报，则更新海报。返回其ID。"""
+    # 修正：将年份也作为唯一性检查的一部分
     stmt = select(Anime).where(Anime.title == title, Anime.season == season)
+    if year:
+        stmt = stmt.where(Anime.year == year)
     result = await session.execute(stmt)
     anime = result.scalar_one_or_none()
 
@@ -209,8 +212,10 @@ async def create_anime(session: AsyncSession, anime_data: models.AnimeCreate) ->
     Manually creates a new anime entry in the database, and automatically
     creates and links a default 'custom' source for it.
     """
-    # Check if an anime with the same title and season already exists
-    existing_anime = await find_anime_by_title_and_season(session, anime_data.title, anime_data.season)
+    # 修正：在重复检查时也包含年份
+    existing_anime = await find_anime_by_title_season_year(
+        session, anime_data.title, anime_data.season, anime_data.year
+    )
     if existing_anime:
         raise ValueError(f"作品 '{anime_data.title}' (第 {anime_data.season} 季) 已存在。")
 
@@ -379,19 +384,22 @@ async def search_episodes_in_library(session: AsyncSession, anime_title: str, ep
     result = await session.execute(stmt)
     return [dict(row) for row in result.mappings()]
 
-async def find_anime_by_title_and_season(session: AsyncSession, title: str, season: int) -> Optional[Dict[str, Any]]:
+async def find_anime_by_title_season_year(session: AsyncSession, title: str, season: int, year: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
-    通过标题和季度查找番剧，返回一个简化的字典或None。
+    通过标题、季度和可选的年份查找番剧，返回一个简化的字典或None。
     """
     stmt = (
         select(
             Anime.id,
             Anime.title,
-            Anime.season
+            Anime.season,
+            Anime.year
         )
         .where(Anime.title == title, Anime.season == season)
         .limit(1)
     )
+    if year:
+        stmt = stmt.where(Anime.year == year)
     result = await session.execute(stmt)
     row = result.mappings().first()
     return dict(row) if row else None
@@ -418,6 +426,23 @@ async def find_anime_by_metadata_id_and_season(
     result = await session.execute(stmt)
     row = result.mappings().first()
     return dict(row) if row else None
+
+async def find_episode_by_index(session: AsyncSession, anime_id: int, episode_index: int) -> bool:
+    """
+    检查指定作品的所有数据源中，是否存在特定集数的分集。
+    返回 True 如果存在，否则返回 False。
+    """
+    stmt = (
+        select(Episode.id)
+        .join(AnimeSource, Episode.sourceId == AnimeSource.id)
+        .where(
+            AnimeSource.animeId == anime_id,
+            Episode.episodeIndex == episode_index
+        )
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
 
 async def get_episode_indices_by_anime_title(session: AsyncSession, title: str, season: Optional[int] = None) -> List[int]:
     """根据作品标题和可选的季度号获取已存在的所有分集序号列表。"""
@@ -688,6 +713,15 @@ async def check_source_exists_by_media_id(session: AsyncSession, provider_name: 
     result = await session.execute(stmt)
     return result.scalar_one_or_none() is not None
 
+async def get_anime_id_by_source_media_id(session: AsyncSession, provider_name: str, media_id: str) -> Optional[int]:
+    """通过数据源的provider和media_id获取对应的anime_id。"""
+    stmt = select(AnimeSource.animeId).where(
+        AnimeSource.providerName == provider_name,
+        AnimeSource.mediaId == media_id
+    ).limit(1)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
 async def link_source_to_anime(session: AsyncSession, anime_id: int, provider_name: str, media_id: str) -> int:
     """将一个外部数据源关联到一个番剧条目，如果关联已存在则直接返回其ID。"""
     # 修正：在链接源之前，确保该提供商在 scrapers 表中存在。
@@ -828,7 +862,9 @@ async def check_episode_exists(session: AsyncSession, episode_id: int) -> bool:
 
 async def fetch_comments(session: AsyncSession, episode_id: int) -> List[Dict[str, Any]]:
     """从XML文件获取弹幕。"""
-    episode = await session.get(Episode, episode_id)
+    episode_stmt = select(Episode).where(Episode.id == episode_id)
+    episode_result = await session.execute(episode_stmt)
+    episode = episode_result.scalar_one_or_none()
     if not episode or not episode.danmakuFilePath:
         return []
     
@@ -864,7 +900,9 @@ async def create_episode_if_not_exists(session: AsyncSession, anime_id: int, sou
     new_episode_id = int(new_episode_id_str)
 
     # 2. 直接检查这个ID是否存在
-    existing_episode = await session.get(Episode, new_episode_id)
+    existing_episode_stmt = select(Episode).where(Episode.id == new_episode_id)
+    existing_episode_result = await session.execute(existing_episode_stmt)
+    existing_episode = existing_episode_result.scalar_one_or_none()
     if existing_episode:
         return existing_episode.id
 
@@ -897,11 +935,11 @@ async def save_danmaku_for_episode(
     if not comments:
         return 0
 
-    episode = await session.get(
-        Episode, 
-        episode_id, 
-        options=[selectinload(Episode.source).selectinload(AnimeSource.anime)]
+    episode_stmt = select(Episode).where(Episode.id == episode_id).options(
+        selectinload(Episode.source).selectinload(AnimeSource.anime)
     )
+    episode_result = await session.execute(episode_stmt)
+    episode = episode_result.scalar_one_or_none()
     if not episode:
         raise ValueError(f"找不到ID为 {episode_id} 的分集")
 
@@ -1379,22 +1417,33 @@ async def sync_metadata_sources_to_db(session: AsyncSession, provider_names: Lis
 async def get_all_metadata_source_settings(session: AsyncSession) -> List[Dict[str, Any]]:
     stmt = select(MetadataSource).order_by(MetadataSource.displayOrder)
     result = await session.execute(stmt)
-    return [
-        {"providerName": s.providerName, "isEnabled": s.isEnabled, "isAuxSearchEnabled": s.isAuxSearchEnabled, "displayOrder": s.displayOrder, "useProxy": s.useProxy, "isFailoverEnabled": s.isFailoverEnabled}
-        for s in result.scalars()
-    ]
+    return [{
+        "providerName": s.providerName, "isEnabled": s.isEnabled,
+        "isAuxSearchEnabled": s.isAuxSearchEnabled, "displayOrder": s.displayOrder,
+        "useProxy": s.useProxy, "isFailoverEnabled": s.isFailoverEnabled,
+        "logRawResponses": s.logRawResponses
+    } for s in result.scalars()]
 
 async def update_metadata_sources_settings(session: AsyncSession, settings: List['models.MetadataSourceSettingUpdate']):
     for s in settings:
         is_aux_enabled = True if s.providerName == 'tmdb' else s.isAuxSearchEnabled
-        # 新增：确保 isFailoverEnabled 字段被正确处理
-        is_failover_enabled = s.isFailoverEnabled if hasattr(s, 'isFailoverEnabled') else False
         await session.execute(
             update(MetadataSource)
             .where(MetadataSource.providerName == s.providerName)
-            .values(isAuxSearchEnabled=is_aux_enabled, displayOrder=s.displayOrder, useProxy=s.useProxy, isFailoverEnabled=is_failover_enabled)
+            .values(isAuxSearchEnabled=is_aux_enabled, displayOrder=s.displayOrder)
         )
     await session.commit()
+
+async def get_metadata_source_setting_by_name(session: AsyncSession, provider_name: str) -> Optional[Dict[str, Any]]:
+    """获取单个元数据源的设置。"""
+    source = await session.get(MetadataSource, provider_name)
+    if source:
+        return {"useProxy": source.useProxy, "logRawResponses": source.logRawResponses}
+    return None
+
+async def update_metadata_source_specific_settings(session: AsyncSession, provider_name: str, settings: Dict[str, Any]):
+    """更新单个元数据源的特定设置（如 logRawResponses）。"""
+    await session.execute(update(MetadataSource).where(MetadataSource.providerName == provider_name).values(**settings))
 
 async def get_enabled_aux_metadata_sources(session: AsyncSession) -> List[Dict[str, Any]]:
     """获取所有已启用辅助搜索的元数据源。"""
@@ -1466,6 +1515,94 @@ async def set_cache(session: AsyncSession, key: str, value: Any, ttl_seconds: in
 
     await session.execute(stmt)
     await session.commit()
+
+async def is_system_task(session: AsyncSession, task_id: str) -> bool:
+    """检查是否为系统内置任务"""
+    system_task_ids = ["system_token_reset"]
+    return task_id in system_task_ids
+
+async def delete_scheduled_task(session: AsyncSession, task_id: str) -> bool:
+    """删除定时任务，但不允许删除系统内置任务"""
+    # 检查是否为系统任务
+    if await is_system_task(session, task_id):
+        raise ValueError("不允许删除系统内置任务。")
+    
+    task = await session.get(orm_models.ScheduledTask, task_id)
+    if not task:
+        return False
+    
+    await session.delete(task)
+    await session.commit()
+    return True
+
+async def update_scheduled_task(
+    session: AsyncSession, 
+    task_id: str, 
+    name: str, 
+    cron: str, 
+    is_enabled: bool
+) -> bool:
+    """更新定时任务，但不允许修改系统内置任务的关键属性"""
+    task = await session.get(orm_models.ScheduledTask, task_id)
+    if not task:
+        return False
+    
+    # 系统任务只允许修改启用状态
+    if await is_system_task(session, task_id):
+        task.isEnabled = is_enabled
+    else:
+        task.name = name
+        task.cronExpression = cron
+        task.isEnabled = is_enabled
+    
+    await session.commit()
+    return True
+
+async def check_duplicate_import(
+    session: AsyncSession,
+    provider: str,
+    media_id: str,
+    anime_title: str,
+    media_type: str,
+    season: Optional[int] = None,
+    year: Optional[int] = None,
+    is_single_episode: bool = False,
+    episode_index: Optional[int] = None
+) -> Optional[str]:
+    """
+    统一的重复导入检查函数
+    返回None表示可以导入，返回字符串表示重复原因
+    """
+    # 1. 检查数据源是否已存在
+    source_exists = await check_source_exists_by_media_id(session, provider, media_id)
+    if source_exists:
+        # 对于单集导入，即使数据源存在，也要检查具体集数是否存在
+        if is_single_episode and episode_index is not None:
+            anime_id = await get_anime_id_by_source_media_id(session, provider, media_id)
+            if anime_id:
+                episode_exists = await find_episode_by_index(session, anime_id, episode_index)
+                if episode_exists:
+                    return f"作品 '{anime_title}' 的第 {episode_index} 集已在媒体库中，无需重复导入"
+                else:
+                    # 数据源存在但集数不存在，允许导入
+                    return None
+        # 对于全量导入或无法确定集数的情况，仍然阻止重复导入
+        return f"该数据源已存在于弹幕库中"
+
+    if not is_single_episode:  # 只在全量导入时检查作品重复
+        # 2. 检查作品是否已存在（标题+季度+年份都相同才算重复）
+        season_for_check = season if season is not None else 1
+        if media_type == 'movie':
+            season_for_check = 1
+
+        existing_anime = await find_anime_by_title_season_year(
+            session, anime_title, season_for_check, year
+        )
+        if existing_anime:
+            year_info = f" ({year}年)" if year else ""
+            return f"作品 '{anime_title}'{year_info} (第 {season_for_check} 季) 已存在于媒体库中"
+
+    return None
 
 async def update_config_value(session: AsyncSession, key: str, value: str):
     dialect = session.bind.dialect.name
@@ -1646,17 +1783,20 @@ async def increment_token_call_count(session: AsyncSession, token_id: int):
     if not token:
         return
 
-    now = get_now()
-    # 如果是新的一天，重置计数器为1
-    if token.lastCallAt is None or token.lastCallAt.date() < now.date():
-        token.dailyCallCount = 1
-    else:
-        # 否则，简单地增加计数
-        token.dailyCallCount += 1
-    
+    # 修正：简化函数职责，现在只负责增加计数。
+    # 重置逻辑已移至 validate_api_token 中，以避免竞争条件。
+    token.dailyCallCount += 1
     # 总是更新最后调用时间
-    token.lastCallAt = now
+    token.lastCallAt = get_now()
     # 注意：这里不 commit，由调用方（API端点）来决定何时提交事务
+
+async def reset_all_token_daily_counts(session: AsyncSession) -> int:
+    """重置所有API Token的每日调用次数为0。"""
+    from sqlalchemy import update
+    stmt = update(ApiToken).values(dailyCallCount=0)
+    result = await session.execute(stmt)
+    await session.commit()
+    return result.rowcount
 
 # --- UA Filter and Log Services ---
 
@@ -1871,6 +2011,12 @@ async def check_scheduled_task_exists_by_type(session: AsyncSession, job_type: s
     result = await session.execute(stmt)
     return result.scalar_one_or_none() is not None
 
+async def get_scheduled_task_id_by_type(session: AsyncSession, job_type: str) -> Optional[str]:
+    """获取指定类型的定时任务ID。"""
+    stmt = select(ScheduledTask.taskId).where(ScheduledTask.jobType == job_type).limit(1)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
 async def get_scheduled_task(session: AsyncSession, task_id: str) -> Optional[Dict[str, Any]]:
     stmt = select(
         ScheduledTask.taskId.label("taskId"), 
@@ -2039,6 +2185,71 @@ async def mark_interrupted_tasks_as_failed(session: AsyncSession) -> int:
     await session.commit()
     return result.rowcount
 
+# --- Webhook Tasks ---
+
+async def create_webhook_task(
+    session: AsyncSession,
+    task_title: str,
+    unique_key: str,
+    payload: Dict[str, Any],
+    webhook_source: str,
+    is_delayed: bool,
+    delay: timedelta
+):
+    """创建一个新的待处理 Webhook 任务。"""
+    now = get_now()
+    execute_time = now + delay if is_delayed else now
+
+    try:
+        new_task = WebhookTask(
+            receptionTime=now,
+            executeTime=execute_time,
+            webhookSource=webhook_source,
+            status="pending",
+            payload=json.dumps(payload, ensure_ascii=False),
+            uniqueKey=unique_key,
+            taskTitle=task_title
+        )
+        session.add(new_task)
+        await session.flush() # Flush to check for unique constraint violation
+    except exc.IntegrityError:
+        # 如果 uniqueKey 已存在，则忽略此重复请求
+        await session.rollback()
+        logger.warning(f"检测到重复的 Webhook 请求 (unique_key: {unique_key})，已忽略。")
+
+async def get_webhook_tasks(session: AsyncSession, page: int, page_size: int, search: Optional[str] = None) -> Dict[str, Any]:
+    """获取待处理的 Webhook 任务列表，支持分页。"""
+    base_stmt = select(WebhookTask)
+    if search:
+        base_stmt = base_stmt.where(WebhookTask.taskTitle.like(f"%{search}%"))
+
+    count_stmt = select(func.count()).select_from(base_stmt.alias("count_subquery"))
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = base_stmt.order_by(WebhookTask.receptionTime.desc()).offset((page - 1) * page_size).limit(page_size)
+    result = await session.execute(stmt)
+    return {"total": total, "list": result.scalars().all()}
+
+async def delete_webhook_tasks(session: AsyncSession, task_ids: List[int]) -> int:
+    """批量删除指定的 Webhook 任务。"""
+    if not task_ids:
+        return 0
+    stmt = delete(WebhookTask).where(WebhookTask.id.in_(task_ids))
+    result = await session.execute(stmt)
+    await session.commit()
+    return result.rowcount
+
+async def get_due_webhook_tasks(session: AsyncSession) -> List[WebhookTask]:
+    """获取所有已到执行时间的待处理任务。"""
+    now = get_now()
+    stmt = select(WebhookTask).where(WebhookTask.status == "pending", WebhookTask.executeTime <= now)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def update_webhook_task_status(session: AsyncSession, task_id: int, status: str):
+    """更新 Webhook 任务的状态。"""
+    await session.execute(update(WebhookTask).where(WebhookTask.id == task_id).values(status=status))
+
 async def get_last_run_result_for_scheduled_task(session: AsyncSession, scheduled_task_id: str) -> Optional[Dict[str, Any]]:
     """获取指定定时任务的最近一次运行结果。"""
     stmt = (
@@ -2195,3 +2406,27 @@ async def add_comments_from_xml(session: AsyncSession, episode_id: int, xml_cont
     await session.commit()
     
     return added_count
+
+async def get_existing_episodes_for_source(
+    session: AsyncSession,
+    provider: str,
+    media_id: str
+) -> List[orm_models.Episode]:
+    """获取指定数据源的所有已存在分集"""
+    # 先找到对应的源
+    source_stmt = select(orm_models.Source).where(
+        orm_models.Source.providerName == provider,
+        orm_models.Source.mediaId == media_id
+    )
+    source_result = await session.execute(source_stmt)
+    source = source_result.scalar_one_or_none()
+    
+    if not source:
+        return []
+    
+    # 获取该源的所有分集
+    episodes_stmt = select(orm_models.Episode).where(
+        orm_models.Episode.sourceId == source.id
+    )
+    episodes_result = await session.execute(episodes_stmt)
+    return episodes_result.scalars().all()

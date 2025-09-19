@@ -3,15 +3,16 @@ import time
 import asyncio
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type, Tuple, TYPE_CHECKING
 from typing import Union
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .. import crud
 from .. import models
-from ..config_manager import ConfigManager
 
+if TYPE_CHECKING:
+    from ..config_manager import ConfigManager
 
 def _roman_to_int(s: str) -> int:
     """将罗马数字字符串转换为整数。"""
@@ -92,7 +93,7 @@ class BaseScraper(ABC):
     _GLOBAL_EPISODE_BLACKLIST_DEFAULT = r"^(.*?)((.+?版)|(特(别|典))|((导|演)员|嘉宾|角色)访谈|福利|彩蛋|花絮|预告|特辑|专访|访谈|幕后|周边|资讯|看点|速看|回顾|盘点|合集|PV|MV|CM|OST|ED|OP|BD|特典|SP|NCOP|NCED|MENU|Web-DL|rip|x264|x265|aac|flac)(.*?)$"
     _PROVIDER_SPECIFIC_BLACKLIST_DEFAULT: str = ""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: "ConfigManager"):
         self._session_factory = session_factory
         self.config_manager = config_manager
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -135,7 +136,10 @@ class BaseScraper(ABC):
     async def _get_from_cache(self, key: str) -> Optional[Any]:
         """从数据库缓存中获取数据。"""
         async with self._session_factory() as session:
-            return await crud.get_cache(session, key)
+            try:
+                return await crud.get_cache(session, key)
+            finally:
+                await session.close()
 
     async def _set_to_cache(self, key: str, value: Any, config_key: str, default_ttl: int):
         """将数据存入数据库缓存，TTL从配置中读取。"""
@@ -143,13 +147,19 @@ class BaseScraper(ABC):
         ttl = int(ttl_str)
         if ttl > 0:
             async with self._session_factory() as session:
-                await crud.set_cache(session, key, value, ttl, provider=self.provider_name)
+                try:
+                    await crud.set_cache(session, key, value, ttl, provider=self.provider_name)
+                    await session.commit()
+                finally:
+                    await session.close()
 
     # 每个子类都必须覆盖这个类属性
     provider_name: str
 
-    # (可选) 子类可以覆盖此字典来声明其可配置的字段
-    configurable_fields: Dict[str, str] = {}
+    # (可选) 子类可以覆盖此字典来声明其可配置的字段。
+    # 格式: { "config_key": ("UI显示的标签", "字段类型", "UI上的提示信息") }
+    # 支持的字段类型: "string", "boolean", "password"
+    configurable_fields: Dict[str, Tuple[str, str, str]] = {}
 
     # (新增) 子类应覆盖此列表，声明它们可以处理的域名
     handled_domains: List[str] = []
@@ -256,7 +266,7 @@ class BaseScraper(ABC):
     async def get_comments(self, episode_id: str, progress_callback: Optional[Callable] = None) -> List[dict]:
         """
         获取给定分集ID的所有弹幕。
-        返回的字典列表应与 crud.bulk_insert_comments 的期望格式兼容。
+        返回的字典列表应与 crud.save_danmaku_for_episode 的期望格式兼容。
         """
         raise NotImplementedError
 
@@ -266,6 +276,48 @@ class BaseScraper(ABC):
         大多数源直接返回字符串，但Bilibili和MGTV需要特殊处理。
         """
         return str(provider_episode_id)
+
+    def _filter_junk_episodes(self, episodes: List["models.ProviderEpisodeInfo"]) -> List["models.ProviderEpisodeInfo"]:
+        """
+        过滤掉垃圾分集（预告、花絮等）
+        """
+        if not episodes:
+            return episodes
+        
+        filtered_episodes = []
+        filtered_out_episodes = []
+        
+        for episode in episodes:
+            # 检查是否匹配垃圾内容模式
+            match = self._GLOBAL_SEARCH_JUNK_TITLE_PATTERN.search(episode.title)
+            if match:
+                junk_type = match.group(0)
+                filtered_out_episodes.append((episode, junk_type))
+            else:
+                filtered_episodes.append(episode)
+        
+        # 打印分集过滤结果
+        self.logger.info(f"{self.provider_name}: 分集过滤结果:")
+        
+        # 打印过滤掉的分集
+        if filtered_out_episodes:
+            for episode, junk_type in filtered_out_episodes:
+                self.logger.info(f"  - 已过滤: {episode.title} (类型: {junk_type})")
+        
+        # 打印保留的分集
+        if filtered_episodes:
+            for episode in filtered_episodes:
+                # 检查是否包含预告关键词但未被过滤
+                title_lower = episode.title.lower()
+                if any(keyword in title_lower for keyword in ['预告', 'preview', 'trailer', 'teaser']):
+                    self.logger.info(f"  - {episode.title} (注意: 标题包含预告关键词但未被过滤)")
+                else:
+                    self.logger.info(f"  - {episode.title}")
+        
+        if not filtered_episodes and not filtered_out_episodes:
+            self.logger.info(f"  - 无分集数据")
+        
+        return filtered_episodes
 
     @abstractmethod
     async def close(self):

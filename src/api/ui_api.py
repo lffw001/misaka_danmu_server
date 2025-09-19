@@ -31,6 +31,7 @@ from ..utils import parse_search_keyword
 from ..webhook_manager import WebhookManager
 from ..image_utils import download_image
 from ..scheduler import SchedulerManager
+from .._version import APP_VERSION
 from thefuzz import fuzz
 from ..config import settings
 from ..timezone import get_now
@@ -72,6 +73,11 @@ async def get_rate_limiter(request: Request) -> RateLimiter:
     """依赖项：从应用状态获取速率限制器"""
     return request.app.state.rate_limiter
 
+@router.get("/version", response_model=Dict[str, str], summary="获取应用版本号")
+async def get_app_version():
+    """获取当前后端应用的版本号。"""
+    return {"version": APP_VERSION}
+
 @router.get(
     "/search/anime",
     response_model=models.AnimeSearchResponse,
@@ -92,6 +98,7 @@ class UIProviderSearchResponse(models.ProviderSearchResponse):
     """扩展了 ProviderSearchResponse 以包含原始搜索的上下文。"""
     search_season: Optional[int] = None
     search_episode: Optional[int] = None
+    supplemental_results: List[models.ProviderSearchInfo] = Field([], description="来自补充源（如360, Douban）的搜索结果")
 @router.get("/search/provider", response_model=UIProviderSearchResponse, summary="从外部数据源搜索节目")
 async def search_anime_provider(
     keyword: str = Query(..., min_length=1, description="搜索关键词"),
@@ -113,9 +120,11 @@ async def search_anime_provider(
         # --- 新增：按季缓存逻辑 ---
         # 缓存键基于核心标题和季度，允许在同一季的不同分集搜索中复用缓存
         cache_key = f"provider_search_{search_title}_{season_to_filter or 'all'}"
+        supplemental_cache_key = f"supplemental_search_{search_title}"
         cached_results_data = await crud.get_cache(session, cache_key)
+        cached_supplemental_results = await crud.get_cache(session, supplemental_cache_key)
 
-        if cached_results_data is not None:
+        if cached_results_data is not None and cached_supplemental_results is not None:
             logger.info(f"搜索缓存命中: '{cache_key}'")
             # 缓存数据已排序和过滤，只需更新当前请求的集数信息
             results = [models.ProviderSearchInfo.model_validate(item) for item in cached_results_data]
@@ -124,6 +133,7 @@ async def search_anime_provider(
             
             return UIProviderSearchResponse(
                 results=results,
+                supplemental_results=[models.ProviderSearchInfo.model_validate(item) for item in cached_supplemental_results],
                 search_season=season_to_filter,
                 search_episode=episode_to_filter
             )
@@ -144,19 +154,23 @@ async def search_anime_provider(
             )
 
         # --- 原有的复杂搜索流程开始 ---
-        tmdb_api_key = await crud.get_config_value(session, "tmdb_api_key", "")
-        enabled_aux_sources = await crud.get_enabled_aux_metadata_sources(session)
+        # 1. 获取别名和补充结果
+        # 修正：检查是否有任何启用的辅助源或强制辅助源
+        has_any_aux_source = await metadata_manager.has_any_enabled_aux_source()
 
-        if not enabled_aux_sources or (len(enabled_aux_sources) == 1 and enabled_aux_sources[0]['providerName'] == 'tmdb' and not tmdb_api_key):
+        if not has_any_aux_source:
             logger.info("未配置或未启用任何有效的辅助搜索源，直接进行全网搜索。")
-            results = await manager.search_all([search_title], episode_info=episode_info)
-            logger.info(f"直接搜索完成，找到 {len(results)} 个原始结果。")
+            supplemental_results = []
+            # 修正：变量名统一
+            all_results = await manager.search_all([search_title], episode_info=episode_info)
+            logger.info(f"直接搜索完成，找到 {len(all_results)} 个原始结果。")
+            filter_aliases = {search_title} # 确保至少有原始标题用于后续处理
         else:
             logger.info("一个或多个元数据源已启用辅助搜索，开始执行...")
             # 修正：增加一个“防火墙”来验证从元数据源返回的别名，防止因模糊匹配导致的结果污染。
             # 1. 获取所有可能的别名
             all_possible_aliases = await metadata_manager.search_aliases_from_enabled_sources(search_title, current_user)
-            
+            all_possible_aliases, supplemental_results = await metadata_manager.search_supplemental_sources(search_title, current_user)
             # 2. 验证每个别名与原始搜索词的相似度
             validated_aliases = set()
             for alias in all_possible_aliases:
@@ -175,6 +189,7 @@ async def search_anime_provider(
             logger.info(f"用于过滤的别名列表: {list(filter_aliases)}")
 
             logger.info(f"将使用解析后的标题 '{search_title}' 进行全网搜索...")
+            # 2. 并行执行主搜索和补充搜索
             all_results = await manager.search_all([search_title], episode_info=episode_info)
 
             def normalize_for_filtering(title: str) -> str:
@@ -200,6 +215,7 @@ async def search_anime_provider(
 
             logger.info(f"别名过滤: 从 {len(all_results)} 个原始结果中，保留了 {len(filtered_results)} 个相关结果。")
             results = filtered_results
+
     except httpx.RequestError as e:
         error_message = f"搜索 '{keyword}' 时发生网络错误: {e}"
         logger.error(error_message, exc_info=True)
@@ -264,11 +280,15 @@ async def search_anime_provider(
         results_to_cache.append(item_copy.model_dump())
 
     if sorted_results:
-        await crud.set_cache(session, cache_key, results_to_cache, ttl_seconds=10800) # 缓存3小时
+        await crud.set_cache(session, cache_key, results_to_cache, ttl_seconds=10800)
+    # 缓存补充结果
+    if supplemental_results:
+        await crud.set_cache(session, supplemental_cache_key, [item.model_dump() for item in supplemental_results], ttl_seconds=10800)
     # --- 缓存逻辑结束 ---
 
     return UIProviderSearchResponse(
         results=sorted_results,
+        supplemental_results=supplemental_results,
         search_season=season_to_filter,
         search_episode=episode_to_filter
     )
@@ -747,7 +767,8 @@ async def refresh_anime(
     scraper_manager: ScraperManager = Depends(get_scraper_manager),
     task_manager: TaskManager = Depends(get_task_manager),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
-    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager)
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager),
+    config_manager: ConfigManager = Depends(get_config_manager)
 ):
     """
     为指定的数据源启动一个刷新任务。
@@ -770,7 +791,7 @@ async def refresh_anime(
         task_title = f"增量刷新: {source_info['title']} ({source_info['providerName']}) - 尝试第{next_episode_index}集"
         task_coro = lambda s, cb: tasks.incremental_refresh_task(
             sourceId=sourceId, nextEpisodeIndex=next_episode_index, session=s, manager=scraper_manager,
-            task_manager=task_manager, progress_callback=cb, animeTitle=source_info["title"],
+            task_manager=task_manager, config_manager=config_manager, progress_callback=cb, animeTitle=source_info["title"],
             rate_limiter=rate_limiter, metadata_manager=metadata_manager
         )
         message_to_return = f"番剧 '{source_info['title']}' 的增量刷新任务已提交。"
@@ -868,8 +889,9 @@ async def get_scraper_settings(
             configurable_fields = base_fields.copy() if base_fields is not None else {}
 
             # 为当前源动态添加其专属的黑名单配置字段
+            # 修正：使用新的元组格式
             blacklist_key = f"{provider_name}_episode_blacklist_regex"
-            configurable_fields[blacklist_key] = "分集标题黑名单 (正则)"
+            configurable_fields[blacklist_key] = ("分集标题黑名单 (正则)", "string", "使用正则表达式过滤不想要的分集标题。")
             full_setting_data['configurableFields'] = configurable_fields
         else:
             # Provide defaults if scraper_class is not found to prevent validation errors
@@ -1114,16 +1136,24 @@ async def get_scraper_config(
     response_data = {}
 
     # 1. 从 scrapers 表获取 useProxy 设置
-    scraper_settings = await crud.get_scraper_setting_by_name(session, providerName)
-    response_data['useProxy'] = scraper_settings.get('useProxy', False) if scraper_settings else False
+    scraper_setting = await crud.get_scraper_setting_by_name(session, providerName)
+    response_data['useProxy'] = scraper_setting.get('useProxy', False) if scraper_setting else False
 
     # 2. 从 config 表获取其他可配置字段
     config_keys_snake = []
+    field_types: Dict[str, str] = {} # 新增：用于存储字段类型
     if hasattr(scraper_class, 'configurable_fields'):
-        config_keys_snake.extend(scraper_class.configurable_fields.keys())
+        for key, (desc, field_type, tooltip) in scraper_class.configurable_fields.items():
+            config_keys_snake.append(key)
+            field_types[key] = field_type
+
     if getattr(scraper_class, 'is_loggable', False):
-        config_keys_snake.append(f"scraper_{providerName}_log_responses")
+        log_key = f"scraper_{providerName}_log_responses"
+        config_keys_snake.append(log_key)
+        field_types[log_key] = "boolean" # 日志开关也是布尔类型
+
     config_keys_snake.append(f"{providerName}_episode_blacklist_regex")
+    field_types[f"{providerName}_episode_blacklist_regex"] = "string"
 
     # 辅助函数，用于将 snake_case 转换为 camelCase
     def to_camel(snake_str):
@@ -1133,8 +1163,8 @@ async def get_scraper_config(
     for db_key in config_keys_snake:
         value = await crud.get_config_value(session, db_key, "")
         camel_key = to_camel(db_key)
-        # 对布尔值进行特殊处理，以匹配前端Switch组件的期望
-        if "log_responses" in db_key:
+        # 新增：根据字段类型动态处理值
+        if field_types.get(db_key) == "boolean":
             response_data[camel_key] = value.lower() == 'true'
         else:
             response_data[camel_key] = value
@@ -1164,14 +1194,15 @@ async def update_scraper_config(
         # 2. 构建所有期望处理的配置键 (camelCase)
         # 修正：使用一个映射来处理前端camelCase键到后端DB键的转换，以兼容混合命名法
         expected_camel_keys = set()
-        camel_to_db_key_map = {}
+        camel_to_db_key_map: Dict[str, str] = {}
 
         def to_camel(snake_str):
             components = snake_str.split('_')
             return components[0] + ''.join(x.title() for x in components[1:])
 
         if hasattr(scraper_class, 'configurable_fields'):
-            for db_key in scraper_class.configurable_fields.keys():
+            # 修正：从元组中解构，以适应新的 configurable_fields 格式
+            for db_key, (desc, field_type, tooltip) in scraper_class.configurable_fields.items():
                 camel_key = to_camel(db_key)
                 expected_camel_keys.add(camel_key)
                 camel_to_db_key_map[camel_key] = db_key
@@ -1191,7 +1222,11 @@ async def update_scraper_config(
         for camel_key, value in payload.items():
             if camel_key in expected_camel_keys:
                 db_key = camel_to_db_key_map[camel_key]
-                value_to_save = str(value) if not isinstance(value, bool) else str(value).lower()
+                # 确保布尔值被正确地保存为 'true' 或 'false' 字符串
+                if isinstance(value, bool):
+                    value_to_save = str(value).lower()
+                else:
+                    value_to_save = str(value)
                 await crud.update_config_value(session, db_key, value_to_save)
                 config_manager.invalidate(db_key)
         
@@ -1751,7 +1786,7 @@ async def generic_import_task(
             if not comments:
                 logger.info(f"分集 '{episode.title}' (DB ID: {episode_db_id}) 未找到弹幕，但已创建分集记录。")
                 continue
-            added_count = await crud.bulk_insert_comments(session, episode_db_id, comments)
+            added_count = await crud.save_danmaku_for_episode(session, episode_db_id, comments)
             total_comments_added += added_count
             logger.info(f"分集 '{episode.title}' (DB ID: {episode_db_id}) 新增 {added_count} 条弹幕。")
         else:
@@ -1776,8 +1811,37 @@ async def edited_import_task(
     if not episodes:
         raise TaskSuccess("没有提供任何分集，任务结束。")
 
-    anime_id: Optional[int] = None
-    source_id: Optional[int] = None
+    # 首先检查是否已存在数据源
+    anime_id = await crud.get_anime_id_by_source_media_id(session, request_data.provider, request_data.media_id)
+    source_id = None
+
+    if anime_id:
+        # 如果数据源已存在，检查哪些分集已经有弹幕
+        # 通过anime_id和provider信息获取source_id
+        sources = await crud.get_anime_sources(session, anime_id)
+        source_id = None
+        for source in sources:
+            if source['providerName'] == request_data.provider and source.get('mediaId') == request_data.media_id:
+                source_id = source['sourceId']
+                break
+        if source_id:
+            existing_episodes = []
+            for episode in episodes:
+                episode_exists = await crud.find_episode_by_index(session, anime_id, episode.episodeIndex)
+                if episode_exists and episode_exists.danmakuFilePath and episode_exists.commentCount > 0:
+                    existing_episodes.append(episode.episodeIndex)
+
+            if existing_episodes:
+                episode_list = ", ".join(map(str, existing_episodes))
+                logger.info(f"检测到已存在弹幕的分集: {episode_list}")
+                # 过滤掉已存在的分集
+                episodes = [ep for ep in episodes if ep.episodeIndex not in existing_episodes]
+                if not episodes:
+                    raise TaskSuccess(f"所有要导入的分集 ({episode_list}) 都已存在弹幕，无需重复导入。")
+                else:
+                    remaining_list = ", ".join(map(str, [ep.episodeIndex for ep in episodes]))
+                    logger.info(f"将跳过已存在的分集 ({episode_list})，继续导入分集: {remaining_list}")
+
     total_comments_added = 0
     total_episodes = len(episodes)
 
@@ -1794,7 +1858,10 @@ async def edited_import_task(
         if anime_id and source_id:
             episode_db_id = await crud.create_episode_if_not_exists(session, anime_id, source_id, episode.episodeIndex, episode.title, episode.url, episode.episodeId)
             if comments:
-                total_comments_added += await crud.bulk_insert_comments(session, episode_db_id, comments)
+                # 由于前面已经过滤了已存在的分集，这里直接导入
+                added_count = await crud.save_danmaku_for_episode(session, episode_db_id, comments)
+                total_comments_added += added_count
+                logger.info(f"分集 '{episode.title}' (DB ID: {episode_db_id}) 新增 {added_count} 条弹幕。")
 
     if total_comments_added == 0: raise TaskSuccess("导入完成，但未找到任何新弹幕。")
     else: raise TaskSuccess(f"导入完成，共新增 {total_comments_added} 条弹幕。")
@@ -1848,7 +1915,7 @@ async def full_refresh_task(source_id: int, session: AsyncSession, manager: Scra
                 episode_info.url, episode_info.episodeId
             )
             if comments:
-                await crud.bulk_insert_comments(session, episode_db_id, comments)
+                await crud.save_danmaku_for_episode(session, episode_db_id, comments)
         
         await session.commit()
         raise TaskSuccess(f"全量刷新完成，共导入 {len(new_episodes)} 个分集，{total_comments_fetched} 条弹幕。")
@@ -1865,7 +1932,9 @@ async def delete_bulk_sources_task(source_ids: List[int], session: AsyncSession,
         progress = int((i / total) * 100)
         await progress_callback(progress, f"正在删除源 {i+1}/{total} (ID: {source_id})...")
         try:
-            source = await session.get(orm_models.AnimeSource, source_id)
+            source_stmt = select(orm_models.AnimeSource).where(orm_models.AnimeSource.id == source_id)
+            source_result = await session.execute(source_stmt)
+            source = source_result.scalar_one_or_none()
             if source:
                 await session.delete(source)
                 await session.commit()
@@ -1915,7 +1984,7 @@ async def refresh_episode_task(episode_id: int, session: AsyncSession, manager: 
             raise TaskSuccess("刷新完成，没有新增弹幕。")
 
         await progress_callback(96, f"正在写入 {len(new_comments)} 条新弹幕...")
-        added_count = await crud.bulk_insert_comments(session, episode_id, new_comments)
+        added_count = await crud.save_danmaku_for_episode(session, episode_id, new_comments)
         await crud.update_episode_fetch_time(session, episode_id)
         logger.info(f"分集 ID: {episode_id} 刷新完成，新增 {added_count} 条弹幕。")
         raise TaskSuccess(f"刷新完成，新增 {added_count} 条弹幕。")
@@ -2100,7 +2169,7 @@ async def manual_import_task(
 
         await progress_callback(90, "正在写入数据库...")
         episode_db_id = await crud.get_or_create_episode(session, source_id, episode_index, title, url, episode_id_for_comments)
-        added_count = await crud.bulk_insert_comments(session, episode_db_id, comments)
+        added_count = await crud.save_danmaku_for_episode(session, episode_db_id, comments)
         raise TaskSuccess(f"手动导入完成，新增 {added_count} 条弹幕。")
     except TaskSuccess:
         raise
@@ -2116,7 +2185,8 @@ async def import_from_provider(
     scraper_manager: ScraperManager = Depends(get_scraper_manager),
     task_manager: TaskManager = Depends(get_task_manager),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
-    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager)
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager),
+    config_manager: ConfigManager = Depends(get_config_manager)
 ):
     try:
         # 在启动任务前检查provider是否存在
@@ -2125,14 +2195,23 @@ async def import_from_provider(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    # 只有在全量导入（非单集导入）时才执行此检查
-    if request_data.currentEpisodeIndex is None:
-        source_exists = await crud.check_source_exists_by_media_id(session, request_data.provider, request_data.mediaId)
-        if source_exists:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="该数据源已存在于弹幕库中，无需重复导入。"
-            )
+    # 替换原有的重复检查逻辑
+    duplicate_reason = await crud.check_duplicate_import(
+        session=session,
+        provider=request_data.provider,
+        media_id=request_data.mediaId,
+        anime_title=request_data.animeTitle,
+        media_type=request_data.type,
+        season=request_data.season,
+        year=request_data.year,
+        is_single_episode=request_data.currentEpisodeIndex is not None,
+        episode_index=request_data.currentEpisodeIndex
+    )
+    if duplicate_reason:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=duplicate_reason
+        )
 
     # 创建一个将传递给任务管理器的协程工厂 (lambda)
     task_coro = lambda session, callback: tasks.generic_import_task(
@@ -2145,6 +2224,7 @@ async def import_from_provider(
         currentEpisodeIndex=request_data.currentEpisodeIndex,
         imageUrl=request_data.imageUrl,
         doubanId=request_data.doubanId,
+        config_manager=config_manager,
         tmdbId=request_data.tmdbId,
         imdbId=None, 
         tvdbId=None, # 手动导入时这些ID为空,
@@ -2185,7 +2265,8 @@ async def import_edited_episodes(
     task_manager: TaskManager = Depends(get_task_manager),
     scraper_manager: ScraperManager = Depends(get_scraper_manager),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
-    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager)
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager),
+    config_manager: ConfigManager = Depends(get_config_manager)
 ):
     """提交一个后台任务，使用用户在前端编辑过的分集列表进行导入。"""
     task_title = f"编辑后导入: {request_data.animeTitle} ({request_data.provider})"
@@ -2194,6 +2275,7 @@ async def import_edited_episodes(
         progress_callback=callback,
         session=session,
         manager=scraper_manager,
+        config_manager=config_manager,
         rate_limiter=rate_limiter,
         metadata_manager=metadata_manager
     )
@@ -2293,7 +2375,8 @@ async def import_from_url(
     scraper_manager: ScraperManager = Depends(get_scraper_manager),
     task_manager: TaskManager = Depends(get_task_manager),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
-    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager)
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager),
+    config_manager: ConfigManager = Depends(get_config_manager)
 ):
     provider = request_data.provider
     url = request_data.url
@@ -2356,6 +2439,7 @@ async def import_from_url(
         current_episode_index=None, image_url=None, douban_id=None, tmdb_id=None, imdb_id=None, tvdb_id=None, bangumi_id=None,
         metadata_manager=metadata_manager,
         progress_callback=callback, session=session, manager=scraper_manager, task_manager=task_manager,
+        config_manager=config_manager,
         rate_limiter=rate_limiter
     )
     
@@ -2522,3 +2606,146 @@ async def get_rate_limit_status(
         secondsUntilReset=seconds_until_reset,
         providers=provider_items
     )
+
+class WebhookSettings(BaseModel):
+    webhookEnabled: bool
+    webhookDelayedImportEnabled: bool
+    webhookDelayedImportHours: int
+    webhookCustomDomain: str
+    webhookFilterMode: str
+    webhookFilterRegex: str
+    webhookLogRawRequest: bool
+
+@router.get("/settings/webhook", response_model=WebhookSettings, summary="获取Webhook设置")
+async def get_webhook_settings(
+    config: ConfigManager = Depends(get_config_manager),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    # 使用 asyncio.gather 并发获取所有配置项
+    (
+        enabled_str, delayed_enabled_str, delay_hours_str, custom_domain_str,
+        filter_mode, filter_regex, log_raw_request_str
+    ) = await asyncio.gather(
+        config.get("webhookEnabled", "true"),
+        config.get("webhookDelayedImportEnabled", "false"),
+        config.get("webhookDelayedImportHours", "24"),
+        config.get("webhookCustomDomain", ""),
+        config.get("webhookFilterMode", "blacklist"),
+        config.get("webhookFilterRegex", ""),
+        config.get("webhookLogRawRequest", "false")
+    )
+    return WebhookSettings(
+        webhookEnabled=enabled_str.lower() == 'true',
+        webhookDelayedImportEnabled=delayed_enabled_str.lower() == 'true',
+        webhookDelayedImportHours=int(delay_hours_str) if delay_hours_str.isdigit() else 24,
+        webhookCustomDomain=custom_domain_str,
+        webhookFilterMode=filter_mode,
+        webhookFilterRegex=filter_regex,
+        webhookLogRawRequest=log_raw_request_str.lower() == 'true'
+    )
+
+@router.put("/settings/webhook", status_code=status.HTTP_204_NO_CONTENT, summary="更新Webhook设置")
+async def update_webhook_settings(
+    payload: WebhookSettings,
+    config: ConfigManager = Depends(get_config_manager),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    # 使用 asyncio.gather 并发保存所有配置项
+    await asyncio.gather(
+        config.setValue("webhookEnabled", str(payload.webhookEnabled).lower()),
+        config.setValue("webhookDelayedImportEnabled", str(payload.webhookDelayedImportEnabled).lower()),
+        config.setValue("webhookDelayedImportHours", str(payload.webhookDelayedImportHours)),
+        config.setValue("webhookCustomDomain", payload.webhookCustomDomain),
+        config.setValue("webhookFilterMode", payload.webhookFilterMode),
+        config.setValue("webhookFilterRegex", payload.webhookFilterRegex),
+        config.setValue("webhookLogRawRequest", str(payload.webhookLogRawRequest).lower())
+    )
+    return
+
+class WebhookTaskItem(BaseModel):
+    id: int
+    receptionTime: datetime
+    executeTime: datetime
+    webhookSource: str
+    status: str
+    taskTitle: str
+
+    class Config:
+        from_attributes = True
+
+class PaginatedWebhookTasksResponse(BaseModel):
+    total: int
+    list: List[WebhookTaskItem]
+
+@router.get("/webhook-tasks", response_model=PaginatedWebhookTasksResponse, summary="获取待处理的Webhook任务列表")
+async def get_webhook_tasks(
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(100, ge=1),
+    search: Optional[str] = Query(None, description="按任务标题搜索"),
+    session: AsyncSession = Depends(get_db_session)
+):
+    result = await crud.get_webhook_tasks(session, page, pageSize, search)
+    return PaginatedWebhookTasksResponse.model_validate(result)
+
+@router.post("/webhook-tasks/delete-bulk", summary="批量删除Webhook任务")
+async def delete_bulk_webhook_tasks(payload: Dict[str, List[int]], session: AsyncSession = Depends(get_db_session)):
+    deleted_count = await crud.delete_webhook_tasks(session, payload.get("ids", []))
+    return {"message": f"成功删除 {deleted_count} 个任务。"}
+
+@router.post("/webhook-tasks/run-now", summary="立即执行选中的Webhook任务")
+async def run_webhook_tasks_now(
+    payload: Dict[str, List[int]],
+    session: AsyncSession = Depends(get_db_session),
+    task_manager: TaskManager = Depends(get_task_manager),
+    scraper_manager: ScraperManager = Depends(get_scraper_manager),
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager),
+    config_manager: ConfigManager = Depends(get_config_manager),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter)
+):
+    """立即执行指定的待处理Webhook任务。"""
+    task_ids = payload.get("ids", [])
+    if not task_ids:
+        return {"message": "没有选中任何任务。"}
+
+    submitted_count = await tasks.run_webhook_tasks_directly_manual(
+        session=session,
+        task_ids=task_ids,
+        task_manager=task_manager,
+        scraper_manager=scraper_manager,
+        metadata_manager=metadata_manager,
+        config_manager=config_manager,
+        rate_limiter=rate_limiter
+    )
+
+    if submitted_count > 0:
+        return {"message": f"已成功提交 {submitted_count} 个任务到执行队列。"}
+    else:
+        return {"message": "没有找到可执行的待处理任务。"}
+
+@router.get("/metadata-sources/{providerName}/config", response_model=Dict[str, Any], summary="获取指定元数据源的配置")
+async def get_metadata_source_config(
+    providerName: str,
+    current_user: models.User = Depends(security.get_current_user),
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager)
+):
+    """获取单个元数据源的详细配置。"""
+    try:
+        return await metadata_manager.getProviderConfig(providerName)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+@router.put("/metadata-sources/{providerName}/config", status_code=status.HTTP_204_NO_CONTENT, summary="更新指定元数据源的配置")
+async def update_metadata_source_config(
+    providerName: str,
+    payload: Dict[str, Any],
+    current_user: models.User = Depends(security.get_current_user),
+    metadata_manager: MetadataSourceManager = Depends(get_metadata_manager)
+):
+    """更新指定元数据源的配置。"""
+    try:
+        await metadata_manager.updateProviderConfig(providerName, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"更新元数据源 '{providerName}' 配置时发生未知错误: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="更新配置时发生内部错误。")

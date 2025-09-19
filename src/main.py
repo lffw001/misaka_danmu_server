@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSON
 from fastapi.middleware.cors import CORSMiddleware  # 新增：处理跨域
 import json
 from .config_manager import ConfigManager
-from .database import init_db_tables, close_db_engine, create_initial_admin_user # type: ignore
+from .database import init_db_tables, close_db_engine, create_initial_admin_user
 from .api import api_router, control_router
 from .dandan_api import dandan_router
 from .task_manager import TaskManager
@@ -21,9 +21,10 @@ from .scraper_manager import ScraperManager
 from .webhook_manager import WebhookManager
 from .scheduler import SchedulerManager
 from .config import settings
-from . import crud, security
+from . import crud, security, orm_models  # 添加 orm_models 导入
 from .log_manager import setup_logging
 from .rate_limiter import RateLimiter
+from ._version import APP_VERSION
 
 print(f"当前环境: {settings.environment}") 
 
@@ -38,6 +39,9 @@ async def lifespan(app: FastAPI):
     """
     # --- Startup Logic ---
     setup_logging()
+
+    # 新增：在日志系统初始化后立即打印版本号
+    logger.info(f"Misaka Danmaku API 版本 {APP_VERSION} 正在启动...")
 
     # init_db_tables 现在处理数据库创建、引擎和会话工厂的创建
     await init_db_tables(app)
@@ -63,6 +67,12 @@ async def lifespan(app: FastAPI):
         'customApiDomain': ('', '用于拼接弹幕API地址的自定义域名。'),
         'webhookApiKey': ('', '用于Webhook调用的安全密钥。'),
         'trustedProxies': ('', '受信任的反向代理IP列表，用逗号分隔。当请求来自这些IP时，将从 X-Forwarded-For 或 X-Real-IP 头中解析真实客户端IP。'),
+        'webhookEnabled': ('true', '是否全局启用 Webhook 功能。'),
+        'webhookDelayedImportEnabled': ('false', '是否为 Webhook 触发的导入启用延时。'),
+        'webhookDelayedImportHours': ('24', 'Webhook 延时导入的小时数。'),
+        'webhookFilterMode': ('blacklist', 'Webhook 标题过滤模式 (blacklist/whitelist)。'),
+        'webhookFilterRegex': ('', '用于过滤 Webhook 标题的正则表达式。'),
+        'webhookLogRawRequest': ('false', '是否记录 Webhook 的原始请求体。'),
         'externalApiKey': ('', '用于外部API调用的安全密钥。'),
         'externalApiDuplicateTaskThresholdHours': (3, '（外部API）重复任务提交阈值（小时）。在此时长内，不允许为同一媒体提交重复的自动导入任务。0为禁用。'),
         'webhookCustomDomain': ('', '用于拼接Webhook URL的自定义域名。'),
@@ -86,6 +96,8 @@ async def lifespan(app: FastAPI):
         'scraperVerificationEnabled': ('false', '是否启用搜索源签名验证。'),
         'bilibiliCookie': ('', '用于访问B站API的Cookie，特别是buvid3。'),
         'gamerCookie': ('', '用于访问巴哈姆特动画疯的Cookie。'),
+        'matchFallbackEnabled': ('false', '是否为匹配接口启用后备机制（自动搜索导入）。'),
+        'iqiyiUseProtobuf': ('false', '（爱奇艺）是否使用新的Protobuf弹幕接口（实验性）。'),
         'gamerUserAgent': ('', '用于访问巴哈姆特动画疯的User-Agent。'),
         # 全局过滤
         'search_result_global_blacklist_cn': (r'特典|预告|广告|菜单|花絮|特辑|速看|资讯|彩蛋|直拍|直播回顾|片头|片尾|幕后|映像|番外篇|纪录片|访谈|番外|短片|加更|走心|解忧|纯享|解读|揭秘|赏析', '用于过滤搜索结果标题的全局中文黑名单(正则表达式)。'),
@@ -115,14 +127,29 @@ async def lifespan(app: FastAPI):
 
 
 
-    app.state.task_manager = TaskManager(session_factory)
+    app.state.task_manager = TaskManager(session_factory, app.state.config_manager)
     app.state.webhook_manager = WebhookManager(
-        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager
+        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager, app.state.config_manager
     )
     app.state.task_manager.start()
     await create_initial_admin_user(app)
+    
+    # 新增：创建系统内置定时任务
+    async with session_factory() as session:
+        existing_task = await session.get(orm_models.ScheduledTask, "system_token_reset")
+        if not existing_task:
+            await crud.create_scheduled_task(
+                session, 
+                task_id="system_token_reset",
+                name="系统内置：Token每日重置",
+                job_type="tokenReset", 
+                cron="0 0 * * *",
+                is_enabled=True
+            )
+            logger.info("已创建系统内置定时任务：重置API Token每日调用次数")
+    
     app.state.cleanup_task = asyncio.create_task(cleanup_task(app))
-    app.state.scheduler_manager = SchedulerManager(session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager)
+    app.state.scheduler_manager = SchedulerManager(session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager, app.state.config_manager)
     await app.state.scheduler_manager.start()
     
     # --- 前端服务 (生产环境) ---
@@ -292,8 +319,8 @@ app.include_router(dandan_router, prefix="/api/v1", tags=["DanDanPlay Compatible
 app.include_router(api_router, prefix="/api")
 
 # --- 新增：挂载 Swagger UI 的静态文件目录 ---
-# 修正：使用绝对路径以确保无论从哪里运行都能找到静态文件目录
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "swagger-ui"
+# 修正：使用相对于工作目录 /app 的绝对路径，使其不再受 __file__ 路径影响
+STATIC_DIR = Path("/app/static/swagger-ui")
 app.mount("/static/swagger-ui", StaticFiles(directory=STATIC_DIR), name="swagger-ui-static")
 
 # 添加一个运行入口，以便直接从配置启动

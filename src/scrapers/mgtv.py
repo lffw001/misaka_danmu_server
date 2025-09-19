@@ -211,6 +211,9 @@ class MgtvScraper(BaseScraper):
         if cached_results:
             self.logger.info(f"MGTV: 从缓存中命中基础搜索结果 (title='{search_title}')")
             all_results = [models.ProviderSearchInfo.model_validate(r) for r in cached_results]
+            # 修复：为缓存结果设置正确的currentEpisodeIndex
+            for item in all_results:
+                item.currentEpisodeIndex = episode_info.get("episode") if episode_info else None
         else:
             self.logger.info(f"MGTV: 缓存未命中，正在为标题 '{search_title}' 执行网络搜索...")
             all_results = await self._perform_network_search(search_title, episode_info)
@@ -432,11 +435,11 @@ class MgtvScraper(BaseScraper):
             raw_episodes = all_episodes
 
             # 统一过滤逻辑
-            blacklist_pattern = await self.get_episode_blacklist_pattern()
+            # 修正：Mgtv源只应使用其专属的黑名单，以避免全局规则误杀。
+            provider_pattern_str = await self.config_manager.get(f"{self.provider_name}_episode_blacklist_regex", self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT)
+            blacklist_pattern = re.compile(provider_pattern_str, re.IGNORECASE) if provider_pattern_str else None
             if blacklist_pattern:
-                original_count = len(raw_episodes)
                 raw_episodes = [ep for ep in raw_episodes if not blacklist_pattern.search(f"{ep.title2} {ep.title}".strip())]
-                self.logger.info(f"MGTV: 根据黑名单规则过滤掉了 {original_count - len(raw_episodes)} 个分集。")
 
             # Apply custom blacklist from config
             blacklist_pattern = await self.get_episode_blacklist_pattern()

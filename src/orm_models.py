@@ -114,6 +114,7 @@ class MetadataSource(Base):
     displayOrder: Mapped[int] = mapped_column("display_order", Integer, default=0)
     useProxy: Mapped[bool] = mapped_column("use_proxy", Boolean, default=False)
     isFailoverEnabled: Mapped[bool] = mapped_column("is_failover_enabled", Boolean, default=False)
+    logRawResponses: Mapped[bool] = mapped_column("log_raw_responses", Boolean, default=False, nullable=False)
 
 class AnimeMetadata(Base):
     __tablename__ = "anime_metadata"
@@ -229,6 +230,19 @@ class ScheduledTask(Base):
     isEnabled: Mapped[bool] = mapped_column("is_enabled", Boolean, default=True)
     lastRunAt: Mapped[Optional[datetime]] = mapped_column("last_run_at", NaiveDateTime)
     nextRunAt: Mapped[Optional[datetime]] = mapped_column("next_run_at", NaiveDateTime)
+
+class WebhookTask(Base):
+    __tablename__ = "webhook_tasks"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    receptionTime: Mapped[datetime] = mapped_column("reception_time", NaiveDateTime, index=True)
+    executeTime: Mapped[datetime] = mapped_column("execute_time", NaiveDateTime, index=True)
+    webhookSource: Mapped[str] = mapped_column("webhook_source", String(50))
+    status: Mapped[str] = mapped_column(String(50), default="pending", index=True) # pending, processing, failed, submitted
+    payload: Mapped[str] = mapped_column(TEXT().with_variant(MEDIUMTEXT, "mysql"))
+    uniqueKey: Mapped[str] = mapped_column("unique_key", String(255), unique=True)
+    taskTitle: Mapped[str] = mapped_column("task_title", String(255))
+
+    __table_args__ = (Index('idx_status_execute_time', 'status', 'execute_time'),)
 
 class TaskHistory(Base):
     __tablename__ = "task_history"

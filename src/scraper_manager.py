@@ -52,7 +52,7 @@ class ScraperManager:
     def _load_public_key(self):
         """从 src/public_key.pem 加载公钥。"""
         # 公钥是应用代码的一部分，而不是用户配置。
-        key_path = Path(__file__).parent / "public_key.pem"
+        key_path = Path("/app/src/public_key.pem")
         if not key_path.exists():
             logging.getLogger(__name__).warning("公钥文件 'src/public_key.pem' 未找到。所有搜索源都将无法通过验证。")
             self._public_key = None
@@ -85,7 +85,7 @@ class ScraperManager:
 
         # 使用 pkgutil 发现模块，这对于 .py, .pyc, .so 文件都有效。
         # 我们需要同时处理源码和编译后的情况。
-        scrapers_dir = Path(__file__).parent / "scrapers"
+        scrapers_dir = Path("/app/src/scrapers")
         for file_path in scrapers_dir.iterdir():
             # 我们只关心 .py 文件或已知的二进制扩展名
             if not (file_path.name.endswith(".py") or file_path.name.endswith(".so") or file_path.name.endswith(".pyd")):
@@ -310,15 +310,17 @@ class ScraperManager:
         在指定的搜索源上搜索，如果失败则尝试故障转移。
         """
         scraper = self.get_scraper(provider)
-        results = await scraper.search(keyword, episode_info)
+        try:
+            results = await scraper.search(keyword, episode_info)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"主搜索源 '{provider}' 搜索时发生错误: {e}", exc_info=True)
+            results = []
         
         # 如果主搜索源没有结果，则尝试故障转移
         if not results and self.metadata_manager:
-            logging.getLogger(__name__).info(f"主搜索源 '{provider}' 未找到结果，正在尝试使用元数据源进行故障转移...")
             try:
                 failover_results = await self.metadata_manager.supplement_search_result(provider, keyword, episode_info)
                 if failover_results:
-                    logging.getLogger(__name__).info(f"通过故障转移找到 {len(failover_results)} 个结果。")
                     return failover_results
             except Exception as e:
                 logging.getLogger(__name__).error(f"搜索故障转移过程中发生错误: {e}", exc_info=True)

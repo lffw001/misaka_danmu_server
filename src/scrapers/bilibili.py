@@ -470,6 +470,9 @@ class BilibiliScraper(BaseScraper):
         if cached_results:
             self.logger.info(f"Bilibili: 从缓存中命中基础搜索结果 (title='{search_title}')")
             all_results = [models.ProviderSearchInfo.model_validate(r) for r in cached_results]
+            # 修复：为缓存结果设置正确的currentEpisodeIndex
+            for item in all_results:
+                item.currentEpisodeIndex = episode_info.get("episode") if episode_info else None
         else:
             self.logger.info(f"Bilibili: 缓存未命中，正在为标题 '{search_title}' 执行网络搜索...")
             all_results = await self._perform_network_search(search_title, episode_info)
@@ -650,13 +653,10 @@ class BilibiliScraper(BaseScraper):
         content_type: str  # "PGC" or "UGC"
     ) -> List[models.ProviderEpisodeInfo]:
         """Applies blacklist filtering to a list of episodes and renumbers their indices."""
-        # 修正：安全地获取并组合黑名单规则，不再错误地拆分正则表达式
-        global_pattern_str = await self.config_manager.get("episode_blacklist_regex", self._GLOBAL_EPISODE_BLACKLIST_DEFAULT)
+        # 修正：Bilibili源只应使用其专属的黑名单，以避免全局规则误杀。
         provider_pattern_str = await self.config_manager.get(f"{self.provider_name}_episode_blacklist_regex", self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT)
 
-        blacklist_rules = []
-        if global_pattern_str: blacklist_rules.append(global_pattern_str)
-        if provider_pattern_str: blacklist_rules.append(provider_pattern_str)
+        blacklist_rules = [provider_pattern_str] if provider_pattern_str else []
         
         if not blacklist_rules:
             # 如果没有黑名单，直接重编号并返回
